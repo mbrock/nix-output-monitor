@@ -13,9 +13,9 @@ import Data.Text qualified as Text
 import Data.Time (NominalDiffTime, ZonedTime, defaultTimeLocale, formatTime)
 import Data.Tree (Forest, Tree (Node))
 import GHC.Records (HasField)
-import NOM.Builds (Derivation (..), FailType (..), Host (..), StorePath (..))
+import NOM.Builds (FailType (..), Host (..))
 import NOM.NixMessage.JSON (ActivityId (..))
-import NOM.Print.Table (Entry, blue, bold, cells, dummy, green, grey, header, label, magenta, markup, markups, prependLines, printAlignedSep, red, text, yellow)
+import NOM.Print.Table (Entry, blue, bold, cells, cyan, dummy, green, grey, header, label, magenta, markup, markups, prependLines, printAlignedSep, red, text, yellow)
 import NOM.Print.Tree (showForest)
 import NOM.State (
   ActivityStatus (..),
@@ -43,7 +43,7 @@ import NOM.State.CacheId.Map qualified as CMap
 import NOM.State.CacheId.Set qualified as CSet
 import NOM.State.Sorting (SortKey, sortKey, summaryIncludingRoot)
 import NOM.State.Tree (mapRootsTwigsAndLeafs)
-import NOM.Update (appendDifferingPlatform)
+import NOM.Update (appendDifferingPlatform, getReportName, getTargetPlatform)
 import Optics (itoList, view, _2)
 import Relude
 import System.Console.ANSI (SGR (Reset), setSGRCode)
@@ -461,7 +461,7 @@ printBuilds nomState@MkNOMV1State{..} hostNums maxHeight = printBuildsWithTime
           activityId <- Strict.toLazy activityId'
           activity_status <- IntMap.lookup activityId.value nomState.activities
           Strict.toLazy $ activity_status.phase
-        drvName = appendDifferingPlatform nomState drvInfo drvInfo.name.storePath.name
+        drvName = appendDifferingPlatform nomState drvInfo (getReportName drvInfo)
         downloadingOutputs = store_paths_in_map drvInfo.dependencySummary.runningDownloads
         uploadingOutputs = store_paths_in_map drvInfo.dependencySummary.runningUploads
         plannedDownloads = store_paths_in drvInfo.dependencySummary.plannedDownloads
@@ -523,15 +523,21 @@ printBuilds nomState@MkNOMV1State{..} hostNums maxHeight = printBuildsWithTime
             | otherwise -> (False, const drvName)
           Planned -> (True, const $ markup blue (todo <> " " <> drvName))
           Building buildInfo ->
-            let phaseList = case phaseMay buildInfo.activityId of
-                  Nothing -> []
-                  Just phase -> [markup bold ("(" <> phase <> ")")]
-                before_time =
-                  [markups [yellow, bold] (running <> " " <> drvName)]
-                    <> hostMarkup True buildInfo.host
-                    <> phaseList
-                after_time = Strict.maybe [] (\x -> ["(" <> average <> " " <> timeDiffSeconds x <> ")"]) buildInfo.estimate
-             in (False, \now -> unwords $ before_time <> ifTimeDiffRelevant now buildInfo.start (<> after_time))
+            let cleanName = getReportName drvInfo
+                platformMay = getTargetPlatform drvInfo
+                phase = Data.Maybe.fromMaybe "build" (phaseMay buildInfo.activityId)
+                -- Format: ⏱ {time} {host} {phase} {platform} {name}
+                host = case buildInfo.host of
+                  Localhost -> ""
+                  h -> hostLabel False h <> " "
+                action = phase
+                platform = case platformMay of
+                  Just p -> " " <> markup cyan p
+                  Nothing -> ""
+                packageName = markups [bold] cleanName
+                main_part = host <> action <> platform <> " " <> packageName
+                time_estimate = Strict.maybe [] (\x -> ["(" <> average <> " " <> timeDiffSeconds x <> ")"]) buildInfo.estimate
+             in (False, \now -> unwords $ ifTimeDiffRelevant now buildInfo.start (\t -> t <> [main_part]) <> time_estimate)
           Failed buildInfo ->
             let MkBuildFail endTime failType = buildInfo.end
                 phaseInfo = case phaseMay buildInfo.activityId of

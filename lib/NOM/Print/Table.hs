@@ -9,6 +9,7 @@ module NOM.Print.Table (
   green,
   yellow,
   blue,
+  cyan,
   magenta,
   red,
   dummy,
@@ -28,7 +29,7 @@ import Data.ByteString.Char8 qualified as ByteString
 import Data.Text qualified as Text
 import Relude hiding (truncate)
 import System.Console.ANSI (
-  Color (Black, Blue, Green, Magenta, Red, Yellow),
+  Color (Black, Blue, Cyan, Green, Magenta, Red, Yellow),
   ColorIntensity (Dull, Vivid),
   ConsoleIntensity (BoldIntensity),
   ConsoleLayer (Foreground),
@@ -97,12 +98,13 @@ addCode code e = e{codes = code : e.codes}
 addColor :: Color -> Entry -> Entry
 addColor = addCode . SetColor Foreground Dull
 
-bold, red, green, yellow, blue, magenta, grey :: Entry -> Entry
+bold, red, green, yellow, blue, cyan, magenta, grey :: Entry -> Entry
 bold = addCode (SetConsoleIntensity BoldIntensity)
 green = addColor Green
 red = addColor Red
 yellow = addColor Yellow
 blue = addColor Blue
+cyan = addColor Cyan
 magenta = addColor Magenta
 grey = addCode $ SetColor Foreground Vivid Black
 

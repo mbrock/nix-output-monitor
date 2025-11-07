@@ -1,4 +1,4 @@
-module NOM.Update (updateStateNixJSONMessage, updateStateNixOldStyleMessage, maintainState, detectLocalFinishedBuilds, appendDifferingPlatform) where
+module NOM.Update (updateStateNixJSONMessage, updateStateNixOldStyleMessage, maintainState, detectLocalFinishedBuilds, appendDifferingPlatform, getReportName, getTargetPlatform) where
 
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
 import Data.ByteString.Char8 qualified as ByteString
@@ -76,7 +76,38 @@ type ProcessingT m a = (UpdateMonad m) => NOMStateT (WriterT [Either NOMError By
 getReportName :: DerivationInfo -> Text
 getReportName drv = case drv.pname of
   Strict.Just pname -> pname
-  Strict.Nothing -> Text.dropWhileEnd (`Set.member` fromList ".1234567890-") drv.name.storePath.name
+  Strict.Nothing -> cleanPackageName drv.name.storePath.name
+
+{- | Extract clean package name, removing platform triplet and version
+From "ncurses-x86_64-unknown-linux-gnufilc-6.5" -> "ncurses"
+From "x86_64-unknown-linux-gnufilc-binutils-2.44" -> "binutils"
+From "bash-5.2p37" -> "bash"
+-}
+cleanPackageName :: Text -> Text
+cleanPackageName name =
+  let
+    -- First strip platform triplet if present
+    withoutPlatform = case Text.splitOn "-" name of
+      -- Pattern: arch-unknown-linux-ABI-package-version...
+      (arch : "unknown" : "linux" : abi : rest)
+        | isArch arch && not (isVersion abi) -> Text.intercalate "-" rest
+      -- Pattern: package-arch-unknown-linux-ABI-version...
+      parts -> stripPlatformFromMiddle parts
+   in
+    -- Then strip version numbers
+    Text.dropWhileEnd (`Set.member` fromList ".1234567890-") withoutPlatform
+ where
+  isVersion = Text.any (`elem` (".0123456789" :: String))
+  isArch t = t `elem` ["x86_64", "aarch64", "i686", "armv7l"]
+  stripPlatformFromMiddle parts =
+    let filtered = filterPlatformParts parts
+     in if filtered /= parts
+          then Text.intercalate "-" filtered
+          else name
+  filterPlatformParts [] = []
+  filterPlatformParts (arch : "unknown" : "linux" : abi : rest)
+    | isArch arch && not (isVersion abi) = filterPlatformParts rest -- Skip the triplet
+  filterPlatformParts (p : rest) = p : filterPlatformParts rest
 
 setInputReceived :: NOMState Bool
 setInputReceived = do
@@ -304,9 +335,47 @@ processJsonMessage = \case
 -- tell [Right (encodeUtf8 (markup yellow "unused message: " <> show _other))]
 
 appendDifferingPlatform :: NOMV1State -> DerivationInfo -> Text -> Text
-appendDifferingPlatform nomState drvInfo = case (nomState.buildPlatform, drvInfo.platform) of
-  (Strict.Just p1, Strict.Just p2) | p1 /= p2 -> (<> "-" <> p2)
-  _ -> id
+appendDifferingPlatform _nomState drvInfo name =
+  -- For backward compatibility with activity prefix
+  case extractTargetPlatform drvInfo.name.storePath.name of
+    Just abi -> name <> " [" <> abi <> "]"
+    Nothing -> name
+
+-- | Get the target platform from a derivation, if it's cross-compiled
+getTargetPlatform :: DerivationInfo -> Maybe Text
+getTargetPlatform drvInfo = extractTargetPlatform drvInfo.name.storePath.name
+
+{- | Extract target ABI from derivation name if it contains a target triplet
+From "ncurses-x86_64-unknown-linux-gnufilc-6.5" -> Just "gnufilc"
+From "x86_64-unknown-linux-gnufilc-binutils-2.44" -> Just "gnufilc"
+From "bash-5.2p37" -> Nothing
+-}
+extractTargetPlatform :: Text -> Maybe Text
+extractTargetPlatform drvName =
+  -- Look for patterns like "x86_64-unknown-linux-SOMETHING" or "aarch64-apple-darwin"
+  -- Can be at start: "x86_64-unknown-linux-gnufilc-binutils"
+  -- Or in middle: "ncurses-x86_64-unknown-linux-gnufilc-6.5"
+  let parts = Text.splitOn "-" drvName
+   in case parts of
+        -- Pattern at start: arch-unknown-linux-ABI-package
+        (arch : "unknown" : "linux" : abi : _)
+          | isArch arch && not (isVersion abi) -> Just abi
+        -- Pattern in middle: look through reversed parts
+        _ | Text.isInfixOf "-unknown-linux-" drvName ->
+          case reverse parts of
+            (version : abi : "linux" : "unknown" : arch : _)
+              | isVersion version && isArch arch -> Just abi
+            (abi : "linux" : "unknown" : arch : _)
+              | isArch arch -> Just abi
+            _ -> Nothing
+        -- Look for arch-apple-darwin patterns
+        _
+          | Text.isInfixOf "-apple-darwin" drvName ->
+              Just "darwin"
+        _ -> Nothing
+ where
+  isVersion = Text.any (`elem` (".0123456789" :: String))
+  isArch t = t `elem` ["x86_64", "aarch64", "i686", "armv7l"]
 
 activityPrefix :: Maybe Activity -> ProcessingT m Text
 activityPrefix activities = case activities of
