@@ -607,20 +607,20 @@ printBuilds nomState@MkNOMState{..} hostAbbrevs limits = printBuildsWithTime
           Building buildInfo ->
             let cleanName = getReportName drvInfo
                 platformMay = getTargetPlatform drvInfo
-                phase = fromMaybe "build" (phaseMay buildInfo.activityId)
-                -- Format: ⏱ {time} {host} {phase} {platform} {name}
-                host = case buildInfo.host of
-                  Localhost -> ""
-                  h -> hostLabel False h <> " "
-                action = phase
-                platform = case platformMay of
-                  Just p -> " " <> markup cyan p
-                  Nothing -> ""
-                packageName = markups [bold] cleanName
-                main_part = host <> action <> platform <> " " <> packageName
-                time_estimate = Strict.maybe [] (\x -> ["(" <> average <> " " <> timeDiffSeconds x <> ")"]) buildInfo.estimate
+                phaseList = case phaseMay buildInfo.activityId of
+                  Nothing -> []
+                  Just phase -> [markup bold ("(" <> phase <> ")")]
+                platformTag = case platformMay of
+                  Just p -> [markup cyan ("[" <> p <> "]")]
+                  Nothing -> []
+                before_time =
+                  [markups [yellow, bold] (running <> " " <> cleanName)]
+                    <> platformTag
+                    <> hostMarkup True buildInfo.host
+                    <> phaseList
+                after_time = Strict.maybe [] (\x -> ["(" <> average <> " " <> timeDiffSeconds x <> ")"]) buildInfo.estimate
              in ( False
-                , \now -> unwords $ ifTimeDiffRelevant now buildInfo.start (\t -> t <> [main_part]) <> time_estimate
+                , \now -> unwords $ before_time <> ifTimeDiffRelevant now buildInfo.start (<> after_time)
                 , const Nothing
                 )
           Failed buildInfo ->
