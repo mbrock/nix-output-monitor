@@ -525,7 +525,7 @@ printBuilds nomState@MkNOMV1State{..} hostNums maxHeight = printBuildsWithTime
           Building buildInfo ->
             let cleanName = getReportName drvInfo
                 platformMay = getTargetPlatform drvInfo
-                phase = Data.Maybe.fromMaybe "build" (phaseMay buildInfo.activityId)
+                phase = fromMaybe "build" (phaseMay buildInfo.activityId)
                 -- Format: ⏱ {time} {host} {phase} {platform} {name}
                 host = case buildInfo.host of
                   Localhost -> ""
