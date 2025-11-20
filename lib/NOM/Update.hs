@@ -8,8 +8,8 @@ import Data.Sequence.Strict qualified as Seq
 import Data.Set qualified as Set
 import Data.Strict qualified as Strict
 import Data.Text qualified as Text
-import Data.Time (NominalDiffTime)
-import NOM.Builds (Derivation (..), FailType, Host (..), StorePath (..), parseDerivation, parseIndentedStoreObject, parseStorePath)
+import Data.Time (NominalDiffTime, UTCTime)
+import NOM.Builds (Derivation (..), FailType, Host (..), HostContext (..), StorePath (..), forgetProto, parseDerivation, parseIndentedStoreObject, parseStorePath)
 import NOM.Error (NOMError)
 import NOM.NixMessage.JSON (Activity, ActivityId, ActivityResult (..), MessageAction (..), NixJSONMessage (..), ResultAction (..), StartAction (..), StopAction (..), Verbosity (..))
 import NOM.NixMessage.JSON qualified as JSON
@@ -30,9 +30,8 @@ import NOM.State (
   EvalInfo (..),
   InputDerivation (..),
   InterestingActivity (..),
-  NOMState,
-  NOMStateT,
-  NOMV1State (..),
+  MonadNOMState,
+  NOMState (..),
   OutputName (Out),
   ProgressState (..),
   RunningBuildInfo,
@@ -65,13 +64,14 @@ import NOM.Update.Monad (
   MonadReadDerivation (..),
   UpdateMonad,
  )
-import NOM.Util (foldMapEndo, parseOneText)
+import NOM.Util (parseOneText, repeatedly)
 import Nix.Derivation qualified as Nix
-import Optics (gconstructor, gfield, has, preview, (%), (%~), (.~))
+import Numeric.Extra (intToDouble)
+import Optics (assign', at, has, ix, modifying', only, preuse, preview, use, (%), (%~), (.~))
 import Relude
 import System.Console.ANSI (SGR (Reset), setSGRCode)
 
-type ProcessingT m a = (UpdateMonad m) => NOMStateT (WriterT [Either NOMError ByteString] m) a
+type ProcessingT m a = (UpdateMonad m, MonadNOMState m) => WriterT [Either NOMError ByteString] m a
 
 getReportName :: DerivationInfo -> Text
 getReportName drv = case drv.pname of
@@ -109,47 +109,44 @@ cleanPackageName name =
     | isArch arch && not (isVersion abi) = filterPlatformParts rest -- Skip the triplet
   filterPlatformParts (p : rest) = p : filterPlatformParts rest
 
-setInputReceived :: NOMState Bool
+setInputReceived :: (MonadNOMState m) => m Bool
 setInputReceived = do
   s <- get
   let change = s.progressState == JustStarted
   when change (put s{progressState = InputReceived})
   pure change
 
-maintainState :: Double -> NOMV1State -> NOMV1State
+maintainState :: Double -> NOMState -> NOMState
 maintainState now = execState $ do
   currentState <- get
   unless (CSet.null currentState.touchedIds) $ do
     sortDepsOfSet currentState.touchedIds
-    modify' (gfield @"forestRoots" %~ Seq.sortOn (sortKey currentState))
-    modify' (gfield @"touchedIds" .~ mempty)
+    modifying' #forestRoots $ Seq.sortOn (sortKey currentState)
+    assign' #touchedIds mempty
   when (Strict.isJust currentState.evaluationState.lastFileName && currentState.evaluationState.at <= now - 5 && currentState.fullSummary /= mempty) do
-    modify' (gfield @"evaluationState" %~ \old_state -> old_state{lastFileName = Strict.Nothing})
+    assign' (#evaluationState % #lastFileName) Strict.Nothing
 
 minTimeBetweenPollingNixStore :: NominalDiffTime
 minTimeBetweenPollingNixStore = 0.2 -- in seconds
 
 {-# INLINE updateStateNixJSONMessage #-}
-updateStateNixJSONMessage :: forall m. (UpdateMonad m) => NixJSONMessage -> NOMV1State -> m (([NOMError], ByteString), Maybe NOMV1State)
-updateStateNixJSONMessage input inputState =
-  {-# SCC "updateStateNixJSONMessage" #-}
-  do
-    ((hasChanged, msgs), outputState) <-
-      {-# SCC "run_state" #-}
-      runStateT
-        ( runWriterT
-            ( sequence
-                [ {-# SCC "input_received" #-} setInputReceived
-                , {-# SCC "processing" #-} processJsonMessage input
-                ]
-            )
-        )
-        inputState
-    let retval = if or hasChanged then Just outputState else Nothing
-        errors = lefts msgs
-    {-# SCC "emitting_new_state" #-} pure ((errors, ByteString.unlines (rights msgs)), retval)
+updateStateNixJSONMessage :: forall m. (UpdateMonad m) => NixJSONMessage -> NOMState -> m (([NOMError], ByteString), Maybe NOMState)
+updateStateNixJSONMessage input inputState = do
+  ((hasChanged, msgs), outputState) <-
+    runStateT
+      ( runWriterT
+          ( sequence
+              [ setInputReceived
+              , processJsonMessage input
+              ]
+          )
+      )
+      inputState
+  let retval = if or hasChanged then Just outputState else Nothing
+      errors = lefts msgs
+  pure ((errors, ByteString.unlines (rights msgs)), retval)
 
-updateStateNixOldStyleMessage :: forall m. (UpdateMonad m) => (Maybe NixOldStyleMessage, ByteString) -> (Maybe Double, NOMV1State) -> m (([NOMError], ByteString), (Maybe Double, Maybe NOMV1State))
+updateStateNixOldStyleMessage :: forall m. (UpdateMonad m) => (Maybe NixOldStyleMessage, ByteString) -> (Maybe Double, NOMState) -> m (([NOMError], ByteString), (Maybe Double, Maybe NOMState))
 updateStateNixOldStyleMessage (result, input) (inputAccessTime, inputState) = do
   now <- getNow
 
@@ -180,7 +177,7 @@ updateStateNixOldStyleMessage (result, input) (inputAccessTime, inputState) = do
       errors = lefts msgs
   pure ((errors, input <> ByteString.unlines (rights msgs)), retval)
 
-derivationIsCompleted :: (UpdateMonad m) => DerivationId -> NOMStateT m Bool
+derivationIsCompleted :: (UpdateMonad m, MonadNOMState m) => DerivationId -> m Bool
 derivationIsCompleted drvId =
   derivationToAnyOutPath drvId >>= \case
     Nothing -> pure False -- Derivation has no "out" output.
@@ -232,25 +229,20 @@ processJsonMessage = \case
     let message' = encodeUtf8 message
     tell [Right message']
     case parseIndentedStoreObject message of
-      Just (Right download) ->
-        {-# SCC "plan_download" #-}
-        withChange do
-          plannedDownloadId <- getStorePathId download
-          planDownloads $ one plannedDownloadId
-      Just (Left build) ->
-        {-# SCC "plan_build" #-}
-        withChange do
-          plannedDrvId <- lookupDerivation build
-          planBuilds (one plannedDrvId)
+      Just (Right download) -> withChange do
+        plannedDownloadId <- getStorePathId download
+        planDownloads $ one plannedDownloadId
+      Just (Left build) -> withChange do
+        plannedDrvId <- lookupDerivation build
+        planBuilds (one plannedDrvId)
       _ -> noChange
   Message MkMessageAction{message, level = Error}
     | stripped <- stripANSICodes message
     , Text.isPrefixOf "error:" stripped ->
-        {-# SCC "pass_through_error" #-}
         withChange do
           errors <- gets (.nixErrors)
           unless (any (Text.isInfixOf (Text.drop 7 stripped) . stripANSICodes) errors) do
-            modify' (gfield @"nixErrors" %~ (<> (message Seq.<| mempty)))
+            modifying' #nixErrors (<> (message Seq.<| mempty))
             tell [Right (encodeUtf8 message)]
           whenJust
             (snd <$> parseOneText Parser.oldStyleParser (stripped <> "\n"))
@@ -258,11 +250,10 @@ processJsonMessage = \case
   Message MkMessageAction{message, level = Error}
     | stripped <- stripANSICodes message
     , Text.isPrefixOf "trace:" stripped ->
-        {-# SCC "pass_through_error" #-}
         withChange do
           traces <- gets (.nixTraces)
           unless (any (Text.isInfixOf (Text.drop 7 stripped) . stripANSICodes) traces) do
-            modify' (gfield @"nixTraces" %~ (<> (message Seq.<| mempty)))
+            modifying' #nixTraces (<> (message Seq.<| mempty))
             tell [Right (encodeUtf8 message)]
           whenJust
             (snd <$> parseOneText Parser.oldStyleParser (stripped <> "\n"))
@@ -270,63 +261,74 @@ processJsonMessage = \case
   Message MkMessageAction{message} | Just suffix <- Text.stripPrefix "evaluating file '" message -> withChange do
     let file_name = Text.dropEnd 1 suffix
     now <- getNow
-    modify' (gfield @"evaluationState" %~ \old -> old{count = old.count + 1, lastFileName = Strict.Just file_name, at = now})
-  Result MkResultAction{result = BuildLogLine line, id = id'} ->
-    {-# SCC "pass_through_build_line" #-}
-    do
-      nomState <- get
-      prefix <- activityPrefix ((.activity) <$> IntMap.lookup id'.value nomState.activities)
-      tell [Right (encodeUtf8 (prefix <> line))]
-      noChange
+    modifying' #evaluationState \old -> old{count = old.count + 1, lastFileName = Strict.Just file_name, at = now}
+  Result MkResultAction{result = BuildLogLine line, id = id'} -> do
+    nomState <- get
+    prefix <- activityPrefix ((.activity) <$> IntMap.lookup id'.value nomState.activities)
+    tell [Right (encodeUtf8 (prefix <> line))]
+    noChange
   Result MkResultAction{result = SetPhase phase, id = id'} ->
-    {-# SCC "updating_phase" #-} withChange $ modify' (gfield @"activities" %~ IntMap.adjust (gfield @"phase" .~ Strict.Just phase) id'.value)
-  Result MkResultAction{result = Progress progress, id = id'} ->
-    {-# SCC "updating_progress" #-} withChange $ modify' (gfield @"activities" %~ IntMap.adjust (gfield @"progress" .~ Strict.Just progress) id'.value)
-  Start startAction@MkStartAction{id = id'} ->
-    {-# SCC "starting_action" #-}
-    do
-      prefix <- activityPrefix $ Just startAction.activity
-      when (not (Text.null startAction.text) && startAction.level <= Info) $ tell [Right . encodeUtf8 $ prefix <> startAction.text]
-      let set_interesting = withChange do
-            now <- getNow
-            modify' (gfield @"interestingActivities" %~ IntMap.insert id'.value (MkInterestingUnknownActivity startAction.text now))
-      changed <- case startAction.activity of
-        JSON.Build drvName host -> withChange do
+    withChange $ modifying' #activities $ IntMap.adjust (#phase .~ Strict.Just phase) id'.value
+  Result MkResultAction{result = Progress progress, id = id'} -> do
+    whenM (isJust <$> preuse (#buildsActivity % only (Strict.Just id'))) $ do
+      prev_prog <- preuse (#activities % ix id'.value % #progress)
+      case prev_prog of
+        Just (Strict.Just prog) | newdone <- progress.done - prog.done, newdone > 0 -> modifying' #successTokens (+ newdone)
+        _ -> pass
+    withChange $ assign' (#activities % ix id'.value % #progress) (Strict.Just progress)
+  Start startAction@MkStartAction{id = id'} -> do
+    prefix <- activityPrefix $ Just startAction.activity
+    when (not (Text.null startAction.text) && startAction.level <= Info) $ tell [Right . encodeUtf8 $ prefix <> startAction.text]
+    let set_interesting = withChange do
           now <- getNow
-          building host drvName now (Just id')
-        JSON.CopyPath path from Localhost -> withChange do
-          now <- getNow
-          pathId <- getStorePathId path
-          downloading from pathId now
-        JSON.CopyPath path Localhost to -> withChange do
-          now <- getNow
-          pathId <- getStorePathId path
-          uploading to pathId now
-        JSON.Unknown | Text.isPrefixOf "querying info" startAction.text -> set_interesting
-        JSON.QueryPathInfo{} -> set_interesting
-        _ -> noChange -- tell [Right (encodeUtf8 (markup yellow "unused activity: " <> show startAction.id <> " " <> show startAction.activity))]
-      when changed $ modify' (gfield @"activities" %~ IntMap.insert id'.value (MkActivityStatus startAction.activity Strict.Nothing Strict.Nothing))
-      pure changed
-  Stop MkStopAction{id = id'} ->
-    {-# SCC "stoping_action" #-}
-    do
-      activity <- gets (\s -> IntMap.lookup id'.value s.activities)
-      interesting_activity <- gets (\s -> IntMap.lookup id'.value s.interestingActivities)
-      modify' (gfield @"interestingActivities" %~ IntMap.delete id'.value)
-      case activity of
-        Just (MkActivityStatus{activity = JSON.CopyPath path from Localhost}) -> withChange do
-          now <- getNow
-          pathId <- getStorePathId path
-          downloaded from pathId now
-        Just (MkActivityStatus{activity = JSON.CopyPath path Localhost to}) -> withChange do
-          now <- getNow
-          pathId <- getStorePathId path
-          uploaded to pathId now
-        Just (MkActivityStatus{activity = JSON.Build drv host}) -> do
-          drvId <- lookupDerivation drv
-          isCompleted <- derivationIsCompleted drvId
-          if isCompleted then withChange $ finishBuildByDrvId host drvId else noChange
-        _ -> pure (isJust interesting_activity)
+          modifying' #interestingActivities $ IntMap.insert id'.value (MkInterestingUnknownActivity startAction.text now)
+    changed <- case startAction.activity of
+      JSON.Build drvName host -> withChange do
+        now <- getNow
+        building host drvName now (Just id')
+      JSON.CopyPath path from Localhost -> withChange do
+        now <- getNow
+        pathId <- getStorePathId path
+        downloading from pathId now (Just id')
+      JSON.CopyPath path Localhost to -> withChange do
+        now <- getNow
+        pathId <- getStorePathId path
+        uploading to pathId now (Just id')
+      JSON.Unknown | Text.isPrefixOf "querying info" startAction.text -> set_interesting
+      JSON.Builds -> do
+        ba <- use #buildsActivity
+        if Strict.isNothing ba
+          then do
+            assign' #buildsActivity (Strict.Just id')
+            set_interesting
+          else
+            noChange
+      JSON.QueryPathInfo{} -> set_interesting
+      _ -> noChange -- tell [Right (encodeUtf8 (markup yellow "unused activity: " <> show startAction.id <> " " <> show startAction.activity))]
+    when changed $ assign' (#activities % at id'.value) (Just $ MkActivityStatus startAction.activity Strict.Nothing Strict.Nothing)
+    pure changed
+  Stop MkStopAction{id = id'} -> do
+    activity <- preuse (#activities % ix id'.value)
+    interesting_activity <- preuse (#interestingActivities % ix id'.value)
+    modifying' #interestingActivities $ IntMap.delete id'.value
+    case activity of
+      Just (MkActivityStatus{activity = JSON.CopyPath path from Localhost}) -> withChange do
+        now <- getNow
+        pathId <- getStorePathId path
+        downloaded from pathId now
+      Just (MkActivityStatus{activity = JSON.CopyPath path Localhost to}) -> withChange do
+        now <- getNow
+        pathId <- getStorePathId path
+        uploaded to pathId now
+      Just (MkActivityStatus{activity = JSON.Build drv host}) -> do
+        tokens <- use #successTokens
+        if tokens > 0
+          then withChange do
+            modifying' #successTokens pred
+            drvId <- lookupDerivation drv
+            finishBuildByDrvId host drvId
+          else noChange
+      _ -> pure (isJust interesting_activity)
   Plain msg -> tell [Right msg] >> noChange
   ParseError err -> tell [Left err] >> noChange
   Result _other_result -> noChange
@@ -334,7 +336,7 @@ processJsonMessage = \case
 
 -- tell [Right (encodeUtf8 (markup yellow "unused message: " <> show _other))]
 
-appendDifferingPlatform :: NOMV1State -> DerivationInfo -> Text -> Text
+appendDifferingPlatform :: NOMState -> DerivationInfo -> Text -> Text
 appendDifferingPlatform _nomState drvInfo name =
   -- For backward compatibility with activity prefix
   case extractTargetPlatform drvInfo.name.storePath.name of
@@ -385,41 +387,48 @@ activityPrefix activities = case activities of
     pure $ toText (setSGRCode [Reset]) <> markup blue (appendDifferingPlatform nomState drvInfo (getReportName drvInfo) <> "> ")
   _ -> pure ""
 
-movingAverage :: Double
-movingAverage = 0.5
-
-reportFinishingBuilds :: (MonadCacheBuildReports m, MonadNow m) => Host -> NonEmpty (DerivationInfo, Double) -> m BuildReportMap
+reportFinishingBuilds :: (MonadCacheBuildReports m, MonadNow m) => Host WithoutContext -> NonEmpty (DerivationInfo, Double) -> m BuildReportMap
 reportFinishingBuilds host builds = do
   now <- getNow
-  updateBuildReports (modifyBuildReports host (timeDiffInt now <<$>> builds))
+  updateBuildReports =<< injectBuildReports host (timeDiffInt now <<$>> builds)
 
 -- | time difference in seconds rounded down
 timeDiffInt :: Double -> Double -> Int
 timeDiffInt = fmap floor . (-)
 
-finishBuilds :: Host -> [(DerivationId, BuildInfo ())] -> ProcessingT m ()
+finishBuilds :: Host WithContext -> [(DerivationId, BuildInfo ())] -> ProcessingT m ()
 finishBuilds host builds = do
   derivationsWithNames <- forM builds \(drvId, buildInfo) ->
     (,buildInfo.start) <$> getDerivationInfos drvId
   ( \case
       Nothing -> pass
       Just finishedBuilds -> do
-        newBuildReports <- reportFinishingBuilds host finishedBuilds
-        modify' (gfield @"buildReports" .~ newBuildReports)
+        newBuildReports <- reportFinishingBuilds (forgetProto host) finishedBuilds
+        assign' #buildReports newBuildReports
     )
     $ nonEmpty derivationsWithNames
   now <- getNow
   forM_ builds \(drv, info) -> updateDerivationState drv (const (Built (info $> now)))
 
-modifyBuildReports :: Host -> NonEmpty (DerivationInfo, Int) -> BuildReportMap -> BuildReportMap
-modifyBuildReports host = foldMapEndo (uncurry insertBuildReport)
+injectBuildReports :: (MonadNow m) => Host WithoutContext -> NonEmpty (DerivationInfo, Int) -> m (BuildReportMap -> BuildReportMap)
+injectBuildReports host builds = do
+  timestamp <- getUTC
+  pure $ repeatedly (uncurry (insertBuildReport timestamp)) builds
  where
-  insertBuildReport name =
-    Map.insertWith
-      (\new old -> floor (movingAverage * fromIntegral new + (1 - movingAverage) * fromIntegral old))
-      (host, getReportName name)
+  insertBuildReport :: UTCTime -> DerivationInfo -> Int -> BuildReportMap -> BuildReportMap
+  insertBuildReport now name =
+    Map.singleton now
+      >>> Map.insertWith (<>) (host, getReportName name)
+      >>> fmap (fmap enforceHistoryLimit)
 
-failedBuild :: Double -> DerivationId -> FailType -> NOMState ()
+enforceHistoryLimit :: Map UTCTime Int -> Map UTCTime Int
+enforceHistoryLimit m = Map.drop (Map.size m - historyLimit) m
+
+-- | per build
+historyLimit :: Int
+historyLimit = 10
+
+failedBuild :: (MonadNOMState m) => Double -> DerivationId -> FailType -> m ()
 failedBuild now drv code = updateDerivationState drv update
  where
   update = \case
@@ -454,14 +463,14 @@ insertDerivation derivation drvId = do
     derivation.outputs & Map.mapKeys (parseOutputName . Text.copy) & Map.traverseMaybeWithKey \_ path ->
       parseStorePath (toText (Nix.path path)) & mapM \pathName -> do
         pathId <- getStorePathId pathName
-        modify' (gfield @"storePathInfos" %~ CMap.adjust (gfield @"producer" .~ Strict.Just drvId) pathId)
+        modifying' #storePathInfos $ CMap.adjust (#producer .~ Strict.Just drvId) pathId
         pure pathId
   inputSources <-
     derivation.inputSrcs & flip foldlM mempty \acc path -> do
       pathIdMay <-
         parseStorePath (toText path) & mapM \pathName -> do
           pathId <- getStorePathId pathName
-          modify' (gfield @"storePathInfos" %~ CMap.adjust (gfield @"inputFor" %~ CSet.insert drvId) pathId)
+          modifying' #storePathInfos $ CMap.adjust (#inputFor %~ CSet.insert drvId) pathId
           pure pathId
       pure $ maybe id CSet.insert pathIdMay acc
   inputDerivationsList <-
@@ -469,13 +478,13 @@ insertDerivation derivation drvId = do
       depIdMay <-
         parseDerivation (toText drvPath) & mapM \depName -> do
           depId <- lookupDerivation depName
-          modify' (gfield @"derivationInfos" %~ CMap.adjust (gfield @"derivationParents" %~ CSet.insert drvId) depId)
-          modify' (gfield @"forestRoots" %~ Seq.filter (/= depId))
+          modifying' #derivationInfos $ CMap.adjust (#derivationParents %~ CSet.insert drvId) depId
+          modifying' #forestRoots $ Seq.filter (/= depId)
           pure depId
       pure $ (\derivation_id -> MkInputDerivation{derivation = derivation_id, outputs = Set.map (parseOutputName . Text.copy) outputs_of_input}) <$> depIdMay
   let inputDerivations = Seq.fromList inputDerivationsList
   modify
-    ( gfield @"derivationInfos"
+    ( #derivationInfos
         %~ CMap.adjust
           ( \derivation_info ->
               derivation_info
@@ -490,65 +499,88 @@ insertDerivation derivation drvId = do
           drvId
     )
   noParents <- CSet.null . (.derivationParents) <$> getDerivationInfos drvId
-  when noParents $ modify' (gfield @"forestRoots" %~ (drvId Seq.<|))
+  when noParents $ modifying' #forestRoots (drvId Seq.<|)
 
-planBuilds :: Set DerivationId -> NOMState ()
+planBuilds :: (MonadNOMState m) => Set DerivationId -> m ()
 planBuilds drvIds = forM_ drvIds \drvId ->
   updateDerivationState drvId (const Planned)
 
-planDownloads :: Set StorePathId -> NOMState ()
+planDownloads :: (MonadNOMState m) => Set StorePathId -> m ()
 planDownloads pathIds = forM_ pathIds \pathId ->
-  insertStorePathState pathId DownloadPlanned Nothing
+  upsertStorePathState pathId DownloadPlanned (const Nothing)
 
-finishBuildByDrvId :: Host -> DerivationId -> ProcessingT m ()
+finishBuildByDrvId :: Host WithContext -> DerivationId -> ProcessingT m ()
 finishBuildByDrvId host drvId = do
   buildInfoMay <- getBuildInfoIfRunning drvId
   whenJust buildInfoMay \buildInfo -> finishBuilds host [(drvId, buildInfo)]
 
-finishBuildByPathId :: Host -> StorePathId -> ProcessingT m ()
+finishBuildByPathId :: Host WithContext -> StorePathId -> ProcessingT m ()
 finishBuildByPathId host pathId = do
   drvIdMay <- outPathToDerivation pathId
   whenJust drvIdMay (\x -> finishBuildByDrvId host x)
 
-downloading :: Host -> StorePathId -> Double -> NOMState ()
-downloading host pathId start = insertStorePathState pathId (State.Downloading MkTransferInfo{host, start, end = ()}) Nothing
+downloading :: (MonadNOMState m) => Host WithContext -> StorePathId -> Double -> Maybe ActivityId -> m ()
+downloading host pathId start activityId = upsertStorePathState pathId newval $ \case
+  DownloadPlanned -> Just newval
+  _ -> Nothing
+ where
+  newval = State.Downloading MkTransferInfo{host, start, activityId = Strict.toStrict activityId, end = ()}
 
-getBuildInfoIfRunning :: DerivationId -> NOMState (Maybe RunningBuildInfo)
+getBuildInfoIfRunning :: (MonadNOMState m) => DerivationId -> m (Maybe RunningBuildInfo)
 getBuildInfoIfRunning drvId =
   runMaybeT $ do
     drvInfos <- MaybeT (gets (CMap.lookup drvId . (.derivationInfos)))
-    MaybeT (pure ((() <$) <$> preview (gfield @"buildStatus" % gconstructor @"Building") drvInfos))
+    MaybeT (pure ((() <$) <$> preview (#buildStatus % #_Building) drvInfos))
 
-downloaded :: Host -> StorePathId -> Double -> NOMState ()
-downloaded host pathId end = insertStorePathState pathId (Downloaded MkTransferInfo{host, start = end, end = Strict.Nothing}) $ Just \case
-  State.Downloading transfer_info | transfer_info.host == host -> Downloaded (transfer_info $> Strict.Just end)
-  other -> other
+downloaded :: (MonadNOMState m) => Host WithContext -> StorePathId -> Double -> m ()
+downloaded host pathId end = upsertStorePathState pathId newval $ \case
+  State.Downloading transfer_info | transfer_info.host == host -> Just $ Downloaded (transfer_info $> Strict.Just end)
+  DownloadPlanned -> Just newval
+  _ -> Nothing
+ where
+  newval = Downloaded MkTransferInfo{host, start = end, activityId = Strict.Nothing, end = Strict.Nothing}
 
-uploading :: Host -> StorePathId -> Double -> NOMState ()
-uploading host pathId start =
-  insertStorePathState pathId (State.Uploading MkTransferInfo{host, start, end = ()}) Nothing
+uploading :: (MonadNOMState m) => Host WithContext -> StorePathId -> Double -> Maybe ActivityId -> m ()
+uploading host pathId start activityId =
+  upsertStorePathState
+    pathId
+    (State.Uploading MkTransferInfo{host, start, activityId = Strict.toStrict activityId, end = ()})
+    (const Nothing)
 
-uploaded :: Host -> StorePathId -> Double -> NOMState ()
+uploaded :: (MonadNOMState m) => Host WithContext -> StorePathId -> Double -> m ()
 uploaded host pathId end =
-  insertStorePathState pathId (Uploaded MkTransferInfo{host, start = end, end = Strict.Nothing}) $ Just \case
-    State.Uploading transfer_info | transfer_info.host == host -> Uploaded (transfer_info $> Strict.Just end)
-    other -> other
+  upsertStorePathState pathId (Uploaded MkTransferInfo{host, activityId = Strict.Nothing, start = end, end = Strict.Nothing}) \case
+    State.Uploading transfer_info | transfer_info.host == host -> Just $ Uploaded (transfer_info $> Strict.Just end)
+    _ -> Nothing
 
-building :: Host -> Derivation -> Double -> Maybe ActivityId -> ProcessingT m ()
+building :: Host WithContext -> Derivation -> Double -> Maybe ActivityId -> ProcessingT m ()
 building host drvName now activityId = do
   reportName <- getReportName <$> lookupDerivationInfos drvName
-  lastNeeded <- Map.lookup (host, reportName) . (.buildReports) <$> get
+  lastNeeded <- (median <=< Map.lookup (forgetProto host, reportName)) . (.buildReports) <$> get
   drvId <- lookupDerivation drvName
-  updateDerivationState drvId (const (Building (MkBuildInfo now host (Strict.toStrict lastNeeded) (Strict.toStrict activityId) ())))
+  updateDerivationState drvId
+    $ Building
+    . \case
+      Building bi -> bi & #activityId .~ Strict.toStrict activityId -- This happens with ssh-ng. After we already registered this build as started we get a second activity start event. No frome the remote host. Sadly we can not see whether a message is from the local or the remote daemon.
+      -- It would probably be better to only mark the build running on the second start message, but that probably does not work with all remote build protocols other than ssh-ng.
+      _ -> MkBuildInfo now host (Strict.toStrict lastNeeded) (Strict.toStrict activityId) ()
 
-updateDerivationState :: DerivationId -> (BuildStatus -> BuildStatus) -> NOMState ()
+median :: Map a Int -> Maybe Int
+median xs = case drop ((len - 1) `div` 2) $ sort $ toList xs of
+  x : _ | odd len -> Just x
+  low : high : _ -> Just $ floor $ (intToDouble low + intToDouble high) / 2
+  _ -> Nothing
+ where
+  len = Map.size xs
+
+updateDerivationState :: (MonadNOMState m) => DerivationId -> (BuildStatus -> BuildStatus) -> m ()
 updateDerivationState drvId updateStatus = do
   -- Update derivationInfo for this Derivation
   derivation_infos <- getDerivationInfos drvId
   let oldStatus = derivation_infos.buildStatus
       newStatus = updateStatus oldStatus
   when (oldStatus /= newStatus) do
-    modify' (gfield @"derivationInfos" %~ CMap.adjust (gfield @"buildStatus" .~ newStatus) drvId)
+    modifying' #derivationInfos $ CMap.adjust (#buildStatus .~ newStatus) drvId
     let update_summary = updateSummaryForDerivation oldStatus newStatus drvId
         clear_summary = clearDerivationIdFromSummary oldStatus drvId
 
@@ -556,61 +588,53 @@ updateDerivationState drvId updateStatus = do
     updateParents False update_summary clear_summary (derivation_infos.derivationParents)
 
     -- Update fullSummary
-    modify' (gfield @"fullSummary" %~ update_summary)
+    modifying' #fullSummary update_summary
 
-updateParents :: Bool -> (DependencySummary -> DependencySummary) -> (DependencySummary -> DependencySummary) -> DerivationSet -> NOMState ()
+updateParents :: (MonadNOMState m) => Bool -> (DependencySummary -> DependencySummary) -> (DependencySummary -> DependencySummary) -> DerivationSet -> m ()
 updateParents force_direct update_func clear_func direct_parents = do
   relevant_parents <- (if force_direct then CSet.union direct_parents else id) <$> collect_parents True mempty direct_parents
   parents <- collect_parents False mempty direct_parents
   modify
-    ( gfield @"derivationInfos"
+    ( #derivationInfos
         %~ apply_to_all_summaries update_func relevant_parents
         . apply_to_all_summaries clear_func (CSet.difference parents relevant_parents)
     )
-  modify' (gfield @"touchedIds" %~ CSet.union parents)
+  modifying' #touchedIds $ CSet.union parents
  where
   apply_to_all_summaries ::
     (DependencySummary -> DependencySummary) ->
     DerivationSet ->
     DerivationMap DerivationInfo ->
     DerivationMap DerivationInfo
-  apply_to_all_summaries func = foldMapEndo (CMap.adjust (gfield @"dependencySummary" %~ func)) . CSet.toList
-  collect_parents :: Bool -> DerivationSet -> DerivationSet -> NOMState DerivationSet
+  apply_to_all_summaries func = repeatedly (CMap.adjust (#dependencySummary %~ func)) . CSet.toList
+  collect_parents :: (MonadNOMState m) => Bool -> DerivationSet -> DerivationSet -> m DerivationSet
   collect_parents no_irrelevant collected_parents parents_to_scan = case CSet.maxView parents_to_scan of
     Nothing -> pure collected_parents
     Just (current_parent, rest_to_scan) -> do
       drv_infos <- getDerivationInfos current_parent
       transfer_states <- fold <$> forM (Map.lookup Out drv_infos.outputs) (fmap (.states) . \x -> getStorePathInfos x)
-      let all_transfers_completed = all (\x -> has (gconstructor @"Downloaded") x || has (gconstructor @"Uploaded") x) transfer_states
-          is_irrelevant = all_transfers_completed && has (gconstructor @"Unknown") drv_infos.buildStatus || has (gconstructor @"Built") drv_infos.buildStatus
+      let all_transfers_completed = all (\x -> has #_Downloaded x || has #_Uploaded x) transfer_states
+          is_irrelevant = all_transfers_completed && has #_Unknown drv_infos.buildStatus || has #_Built drv_infos.buildStatus
           proceed = collect_parents no_irrelevant
       if is_irrelevant && no_irrelevant
         then proceed collected_parents rest_to_scan
         else proceed (CSet.insert current_parent collected_parents) (CSet.union (CSet.difference drv_infos.derivationParents collected_parents) rest_to_scan)
 
-updateStorePathStates :: StorePathState -> Maybe (StorePathState -> StorePathState) -> Set StorePathState -> Set StorePathState
+updateStorePathStates :: StorePathState -> (StorePathState -> Maybe StorePathState) -> Set StorePathState -> Set StorePathState
 updateStorePathStates new_state update_state =
-  Set.insert new_state
-    . localFilter
-    . ( case update_state of
-          Just update_func -> Set.fromList . fmap update_func . Set.toList
-          Nothing -> id
-      )
- where
-  localFilter = case new_state of
-    DownloadPlanned -> id
-    State.Downloading _ -> Set.filter (DownloadPlanned /=)
-    Downloaded _ -> Set.filter (DownloadPlanned /=) -- We don‘t need to filter downloading state because that has already been handled by the update_state function
-    State.Uploading _ -> id
-    Uploaded _ -> id -- Analogous to downloaded
+  Set.fromList
+    . fmap (either id id)
+    . (\xs -> if any isRight xs then xs else Right new_state : xs)
+    . fmap (\x -> maybe (Left x) Right $ update_state x)
+    . toList
 
-insertStorePathState :: StorePathId -> StorePathState -> Maybe (StorePathState -> StorePathState) -> NOMState ()
-insertStorePathState storePathId new_store_path_state update_store_path_state = do
+upsertStorePathState :: (MonadNOMState m) => StorePathId -> StorePathState -> (StorePathState -> Maybe StorePathState) -> m ()
+upsertStorePathState storePathId new_store_path_state update_store_path_state = do
   -- Update storePathInfos for this Storepath
   store_path_info <- getStorePathInfos storePathId
   let oldStatus = store_path_info.states
       newStatus = updateStorePathStates new_store_path_state update_store_path_state oldStatus
-  modify' (gfield @"storePathInfos" %~ CMap.adjust (gfield @"states" .~ newStatus) storePathId)
+  modifying' #storePathInfos $ CMap.adjust (#states .~ newStatus) storePathId
 
   let update_summary = updateSummaryForStorePath oldStatus newStatus storePathId
       clear_summary = clearStorePathsFromSummary oldStatus storePathId
@@ -619,4 +643,4 @@ insertStorePathState storePathId new_store_path_state update_store_path_state = 
   updateParents True update_summary clear_summary (Strict.maybe id CSet.insert store_path_info.producer store_path_info.inputFor)
 
   -- Update fullSummary
-  modify' (gfield @"fullSummary" %~ update_summary)
+  modifying' #fullSummary update_summary

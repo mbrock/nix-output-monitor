@@ -14,16 +14,11 @@ import Data.Attoparsec.ByteString.Char8 (
   double,
   endOfLine,
   isEndOfLine,
+  skipSpace,
   takeTill,
+  try,
  )
-import NOM.Builds (
-  Derivation (..),
-  FailType (ExitCode, HashMismatch),
-  Host (..),
-  StorePath (..),
-  derivationByteStringParser,
-  storePathByteStringParser,
- )
+import NOM.Builds (Derivation (..), FailType (ExitCode, HashMismatch), Host (..), HostContext (..), StorePath (..), derivationByteStringParser, parseHost, storePathByteStringParser)
 import NOM.NixMessage.OldStyle (NixOldStyleMessage (..))
 import Relude hiding (take, takeWhile)
 
@@ -45,8 +40,8 @@ tick = void $ char '\''
 noTicks :: Parser ByteString
 noTicks = takeTill (== '\'')
 
-host :: Parser Host
-host = Host . decodeUtf8 <$> inTicks noTicks
+host :: Parser (Host WithContext)
+host = parseHost . decodeUtf8 <$> inTicks noTicks
 
 ellipsisEnd :: Parser ()
 ellipsisEnd = string "..." >> endOfLine
@@ -80,10 +75,28 @@ planDownloads =
             , string "these " *> (decimal :: Parser Int) *> string " paths"
             ]
             *> string " will be fetched ("
-            *> double
+            *> byteSize
         )
-    <*> (string " MiB download, " *> double)
-    <*> (string " MiB unpacked):" *> endOfLine *> (fromList <$> many planDownloadLine))
+    <*> (" download, " *> byteSize)
+    <*> (" unpacked):" *> endOfLine *> (fromList <$> many planDownloadLine))
+
+byteSize :: Parser Double
+byteSize = do
+  num <- double
+  skipSpace
+  unit <- anyChar
+  _ <- try (string "iB")
+  power <- case unit of
+    'K' -> pure 1
+    'M' -> pure 2
+    'G' -> pure 3
+    'T' -> pure 4
+    'P' -> pure 5
+    'E' -> pure 6
+    'Z' -> pure 7
+    'Y' -> pure 8
+    x -> fail $ "Unknown unit: " <> [x] <> "iB"
+  pure $ num * (1024 ** power)
 
 planDownloadLine :: Parser StorePath
 planDownloadLine = indent *> storePathByteStringParser <* endOfLine
@@ -125,13 +138,13 @@ transmission = do
   p <- string "path " *> inTicks storePathByteStringParser
   (Uploading p <$> toHost <|> Downloading p <$> fromHost) <* ellipsisEnd
 
-fromHost :: Parser Host
+fromHost :: Parser (Host WithContext)
 fromHost = string " from " *> host
 
-toHost :: Parser Host
+toHost :: Parser (Host WithContext)
 toHost = string " to " *> host
 
-onHost :: Parser Host
+onHost :: Parser (Host WithContext)
 onHost = string " on " *> host
 
 -- building '/nix/store/4lj96sc0pyf76p4w6irh52wmgikx8qw2-nix-output-monitor-0.1.0.3.drv' on 'ssh://maralorn@example.org'...

@@ -8,10 +8,10 @@ import NOM.IO (Stream)
 import NOM.IO.Input (NOMInput (..), UpdateResult (..), statelessUnfoldM)
 import NOM.NixMessage.OldStyle (NixOldStyleMessage)
 import NOM.Parser (parser)
-import NOM.State (NOMV1State)
+import NOM.State (NOMState)
 import NOM.StreamParser (parseStreamAttoparsec)
 import NOM.Update (updateStateNixOldStyleMessage)
-import Optics (gfield)
+import Optics.TH (makeFieldLabelsNoPrefix)
 import Relude
 
 readTextChunks :: Handle -> Stream (Either NOMError ByteString)
@@ -27,14 +27,15 @@ readTextChunks handle =
   bufferSize = 4096 * 16
 
 data OldStyleState = MkOldStyleState
-  { state :: NOMV1State
-  , -- Because old style human nix logs don’t include information for when a
+  { state :: NOMState
+  , -- Because old style human nix logs don't include information for when a
     -- build finishes we monitor the existence of the output paths.
     --  This variable saves when we last polled the disc for
     -- output paths of currently running builds.
     lastRead :: Strict.Maybe Double
   }
-  deriving stock (Generic)
+
+makeFieldLabelsNoPrefix ''OldStyleState
 
 data OldStyleInput = MkOldStyleInput
   { parseResult :: Maybe NixOldStyleMessage
@@ -44,8 +45,8 @@ data OldStyleInput = MkOldStyleInput
 instance NOMInput OldStyleInput where
   withParser body = body (fmap (uncurry MkOldStyleInput . first join) <$> parseStreamAttoparsec parser)
   type UpdaterState OldStyleInput = OldStyleState
-  inputStream = readTextChunks
-  nomState = gfield @"state"
+  inputStreamImpl = readTextChunks
+  nomState = #state
   firstState state' = MkOldStyleState{state = state', lastRead = Strict.Nothing}
   {-# INLINE updateState #-}
   updateState input old_state = mkUpdateResult <$> updateStateNixOldStyleMessage (input.parseResult, input.parsedInput) (Strict.toLazy old_state.lastRead, old_state.state)
@@ -55,5 +56,5 @@ instance NOMInput OldStyleInput where
         { errors
         , output
         , newStateToPrint = new_state
-        , newState = MkOldStyleState (fromMaybe (old_state.state) new_state) (Strict.toStrict new_timestamp)
+        , newState = MkOldStyleState (fromMaybe old_state.state new_state) (Strict.toStrict new_timestamp)
         }

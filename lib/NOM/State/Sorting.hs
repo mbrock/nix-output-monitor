@@ -7,7 +7,6 @@ module NOM.State.Sorting (
 
 import Control.Monad.Extra (pureIf)
 import Data.List.Extra (firstJust)
-import Data.MemoTrie (memo)
 import Data.Sequence.Strict qualified as Seq
 import NOM.State (
   BuildFail (..),
@@ -18,8 +17,8 @@ import NOM.State (
   DerivationInfo (..),
   DerivationSet,
   InputDerivation (..),
-  NOMState,
-  NOMV1State (..),
+  MonadNOMState,
+  NOMState (..),
   StorePathInfo (..),
   TransferInfo (..),
   getDerivationInfos,
@@ -29,24 +28,24 @@ import NOM.State (
  )
 import NOM.State.CacheId.Map qualified as CMap
 import NOM.State.CacheId.Set qualified as CSet
-import NOM.Util (foldMapEndo)
-import Optics (gfield, (%~))
+import NOM.Util (repeatedly)
+import Optics (modifying', (%~))
 import Relude
 import Safe.Foldable (minimumMay)
 
-sortDepsOfSet :: DerivationSet -> NOMState ()
+sortDepsOfSet :: (MonadNOMState m) => DerivationSet -> m ()
 sortDepsOfSet parents = do
   currentState <- get
-  let sort_parent :: DerivationId -> NOMState ()
+  let sort_parent :: (MonadNOMState m) => DerivationId -> m ()
       sort_parent drvId = do
         drvInfo <- getDerivationInfos drvId
-        let newDrvInfo = (gfield @"inputDerivations" %~ sort_derivations) drvInfo
-        modify' (gfield @"derivationInfos" %~ CMap.insert drvId newDrvInfo)
+        let newDrvInfo = (#inputDerivations %~ sort_derivations) drvInfo
+        modifying' #derivationInfos $ CMap.insert drvId newDrvInfo
       sort_derivations :: Seq InputDerivation -> Seq InputDerivation
       sort_derivations = Seq.sortOn (sort_key . (.derivation))
 
       sort_key :: DerivationId -> SortKey
-      sort_key = memo (sortKey currentState)
+      sort_key = sortKey currentState
   mapM_ (\drvId -> sort_parent drvId) $ CSet.toList parents
 
 type SortKey =
@@ -79,17 +78,17 @@ data SortOrder
   | SUnknown
   deriving stock (Eq, Show, Ord)
 
-summaryIncludingRoot :: DerivationId -> NOMState DependencySummary
+summaryIncludingRoot :: (MonadNOMState m) => DerivationId -> m DependencySummary
 summaryIncludingRoot drvId = do
   MkDerivationInfo{dependencySummary, buildStatus} <- getDerivationInfos drvId
   pure (updateSummaryForDerivation Unknown buildStatus drvId dependencySummary)
 
-summaryOnlyThisNode :: DerivationId -> NOMState DependencySummary
+summaryOnlyThisNode :: (MonadNOMState m) => DerivationId -> m DependencySummary
 summaryOnlyThisNode drvId = do
   MkDerivationInfo{outputs, buildStatus} <- getDerivationInfos drvId
   output_infos <- mapM (\x -> (x,) <$> getStorePathInfos x) (toList outputs)
   pure
-    $ foldMapEndo
+    $ repeatedly
       ( \(output_id, output_info) ->
           updateSummaryForStorePath mempty output_info.states output_id
       )
@@ -112,7 +111,7 @@ sortOrder MkDependencySummary{..} = fromMaybe SUnknown (firstJust id sort_entrie
     , SUploaded <$> minimumMay (Down . (.start) <$> completedUploads)
     ]
 
-sortKey :: NOMV1State -> DerivationId -> SortKey
+sortKey :: NOMState -> DerivationId -> SortKey
 sortKey nom_state drvId =
   let (only_this_summary, summary@MkDependencySummary{..}) = evalState ((,) <$> summaryOnlyThisNode drvId <*> summaryIncludingRoot drvId) nom_state
    in (sortOrder only_this_summary, sortOrder summary, Down (CMap.size runningBuilds), Down (CMap.size runningDownloads), CSet.size plannedBuilds + CSet.size plannedDownloads)

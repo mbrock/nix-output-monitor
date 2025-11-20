@@ -1,6 +1,6 @@
 cabal-version: 2.2
 name: nix-output-monitor
-version: 2.1.6
+version: 2.1.8
 synopsis:
   Processes output of Nix commands to show helpful and pretty information
 
@@ -40,24 +40,27 @@ common common-config
     AllowAmbiguousTypes
     BlockArguments
     DataKinds
-    DeriveAnyClass
     DerivingStrategies
     DuplicateRecordFields
     ImportQualifiedPost
     LambdaCase
+    NoDeriveGeneric
     NoFieldSelectors
     NoImplicitPrelude
+    OverloadedLabels
     OverloadedRecordDot
     OverloadedStrings
     RecordWildCards
+    RequiredTypeArguments
     StrictData
+    TemplateHaskell
     TypeFamilies
     TypeOperators
+    UndecidableInstances
     UnicodeSyntax
     ViewPatterns
 
   build-depends:
-    MemoTrie,
     ansi-terminal,
     async,
     attoparsec,
@@ -78,7 +81,6 @@ common common-config
     stm,
     streamly-core,
     strict,
-    strict-types,
     terminal-size,
     text,
     time,
@@ -97,6 +99,7 @@ common common-config
     -Wno-missing-kind-signatures
     -Wno-missing-role-annotations
     -Wno-missing-safe-haskell-mode
+    -Wno-unticked-promoted-constructors
     -Wno-safe
     -Wno-unsafe
     -fno-show-valid-hole-fits

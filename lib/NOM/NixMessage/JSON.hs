@@ -1,12 +1,14 @@
 module NOM.NixMessage.JSON (NixJSONMessage (..), StartAction (..), StopAction (..), MessageAction (..), ResultAction (..), ActivityResult (..), Activity (..), ActivityId (..), Verbosity (..), ActivityProgress (..), ActivityType (..)) where
 
-import NOM.Builds (Derivation (..), Host (..), StorePath (..))
+import NOM.Builds (Derivation (..), Host (..), HostContext (..), StorePath (..))
 import NOM.Error (NOMError)
+import Optics.TH (makeFieldLabelsNoPrefix)
 import Relude
 
 newtype ActivityId = MkId {value :: Int}
   deriving newtype (Show, Eq, Ord)
-  deriving stock (Generic)
+
+makeFieldLabelsNoPrefix ''ActivityId
 
 newtype StopAction = MkStopAction {id :: ActivityId}
   deriving newtype (Eq)
@@ -43,20 +45,20 @@ data ActivityType where
 -- | nix src/libutil/include/nix/util/logging.hh ActivityType
 data Activity where
   Unknown :: Activity
-  CopyPath :: StorePath -> Host -> Host -> Activity
+  CopyPath :: StorePath -> Host WithContext -> Host WithContext -> Activity
   FileTransfer :: Text -> Activity
   Realise :: Activity
   CopyPaths :: Activity
   Builds :: Activity
-  Build :: Derivation -> Host -> Activity
+  Build :: Derivation -> Host WithContext -> Activity
   OptimiseStore :: Activity
   VerifyPaths :: Activity
-  Substitute :: StorePath -> Host -> Activity
-  QueryPathInfo :: StorePath -> Host -> Activity
+  Substitute :: StorePath -> Host WithContext -> Activity
+  QueryPathInfo :: StorePath -> Host WithContext -> Activity
   PostBuildHook :: Derivation -> Activity
   BuildWaiting :: Activity
   FetchTree :: Activity
-  deriving stock (Show, Eq, Ord, Generic)
+  deriving stock (Show, Eq, Ord)
 
 -- | nix src/libutil/include/nix/util/logging.hh ResultType
 data ActivityResult where
@@ -77,7 +79,9 @@ data ActivityProgress = MkActivityProgress
   , running :: Int
   , failed :: Int
   }
-  deriving stock (Show, Eq, Ord, Generic)
+  deriving stock (Show, Eq, Ord)
+
+makeFieldLabelsNoPrefix ''ActivityProgress
 
 data StartAction = MkStartAction
   { id :: ActivityId
@@ -87,11 +91,15 @@ data StartAction = MkStartAction
   }
   deriving stock (Show, Eq)
 
+makeFieldLabelsNoPrefix ''StartAction
+
 data ResultAction = MkResultAction
   { id :: ActivityId
   , result :: ActivityResult
   }
   deriving stock (Show, Eq)
+
+makeFieldLabelsNoPrefix ''ResultAction
 
 data MessageAction = MkMessageAction
   { level :: Verbosity
@@ -102,6 +110,8 @@ data MessageAction = MkMessageAction
   -- , file :: Maybe Text
   }
   deriving stock (Show, Eq)
+
+makeFieldLabelsNoPrefix ''MessageAction
 
 data NixJSONMessage where
   Stop :: StopAction -> NixJSONMessage

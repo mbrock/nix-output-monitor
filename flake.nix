@@ -3,7 +3,7 @@
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-unstable";
     git-hooks = {
-      url = "github:cachix/git-hooks.nix";
+      url = "github:cachix/git-hooks.nix/31792452cf92d204ea0df8e3fddc018235c4cf1b";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -35,6 +35,7 @@
           "stdout.json"
           ".zsh"
           ".bash"
+          ".fish"
           "LICENSE"
           "CHANGELOG.md"
           "default.nix"
@@ -109,6 +110,7 @@
         devShells.default = haskellPackages.shellFor {
           packages = _: [ packages.default ];
           buildInputs = [
+            (lib.getBin pkgs.haskellPackages.fourmolu)
             git-hooks.packages.${system}.default
             pkgs.haskell-language-server
             (lib.getBin pkgs.haskellPackages.weeder)
